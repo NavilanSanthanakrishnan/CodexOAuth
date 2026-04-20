@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+ISSUER = "https://auth.openai.com"
+TOKEN_URL = f"{ISSUER}/oauth/token"
+CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+DEFAULT_AUTH_FILE = Path.home() / ".codex-oauth" / "auth.json"
+DEFAULT_CODEX_CLI_AUTH_FILE = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"
+DEFAULT_MODEL = os.environ.get("CODEX_OAUTH_MODEL", "gpt-5.4")
+DEFAULT_INSTRUCTIONS = "You are a concise assistant."
+REFRESH_SKEW_SECONDS = 120
+
+
+class CodexOAuthError(Exception):
+    pass
+
+
+@dataclass
+class Tokens:
+    access_token: str
+    refresh_token: str = ""
+    expires: float = 0.0
+    account_id: str = ""
+    id_token: str = ""
+    source: str = "unknown"
+    auth_file: Path | None = None
+
+
+def decode_jwt_claims(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except Exception:
+        return {}
+
+
+def extract_account_id(access_token: str, id_token: str = "", fallback: str = "") -> str:
+    for token in (id_token, access_token):
+        claims = decode_jwt_claims(token)
+        if not claims:
+            continue
+        direct = claims.get("chatgpt_account_id")
+        if isinstance(direct, str) and direct:
+            return direct
+        nested = claims.get("https://api.openai.com/auth")
+        if isinstance(nested, dict):
+            account_id = nested.get("chatgpt_account_id")
+            if isinstance(account_id, str) and account_id:
+                return account_id
+        orgs = claims.get("organizations")
+        if isinstance(orgs, list) and orgs and isinstance(orgs[0], dict):
+            org_id = orgs[0].get("id")
+            if isinstance(org_id, str) and org_id:
+                return org_id
+    return fallback
+
+
+def token_expiry_seconds(token: str) -> float:
+    claims = decode_jwt_claims(token)
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)) and exp > 0:
+        return float(exp)
+    return 0.0
+
+
+def is_token_expiring(tokens: Tokens, skew_seconds: int = REFRESH_SKEW_SECONDS) -> bool:
+    exp_seconds = token_expiry_seconds(tokens.access_token)
+    if exp_seconds:
+        return time.time() >= exp_seconds - skew_seconds
+    if tokens.expires:
+        # Some stores keep milliseconds, some keep seconds.
+        expires = tokens.expires / 1000.0 if tokens.expires > 10_000_000_000 else tokens.expires
+        return time.time() >= expires - skew_seconds
+    return False
+
+
+def read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.expanduser().read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def tokens_from_private_store(path: Path) -> Tokens | None:
+    data = read_json_file(path)
+    if not isinstance(data, dict):
+        return None
+    access_token = str(data.get("access_token") or "")
+    if not access_token:
+        return None
+    id_token = str(data.get("id_token") or "")
+    account_id = extract_account_id(access_token, id_token, str(data.get("account_id") or ""))
+    return Tokens(
+        access_token=access_token,
+        refresh_token=str(data.get("refresh_token") or ""),
+        expires=float(data.get("expires") or 0),
+        account_id=account_id,
+        id_token=id_token,
+        source="private-store",
+        auth_file=path,
+    )
+
+
+def tokens_from_codex_cli(path: Path) -> Tokens | None:
+    data = read_json_file(path)
+    if not isinstance(data, dict):
+        return None
+    raw_tokens = data.get("tokens")
+    if not isinstance(raw_tokens, dict):
+        return None
+    access_token = str(raw_tokens.get("access_token") or "")
+    if not access_token:
+        return None
+    id_token = str(raw_tokens.get("id_token") or "")
+    account_id = extract_account_id(access_token, id_token, str(raw_tokens.get("account_id") or ""))
+    return Tokens(
+        access_token=access_token,
+        refresh_token=str(raw_tokens.get("refresh_token") or ""),
+        account_id=account_id,
+        id_token=id_token,
+        source="codex-cli",
+        auth_file=path,
+    )
+
+
+def save_private_tokens(path: Path, tokens: Tokens) -> None:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "access_token": tokens.access_token,
+        "refresh_token": tokens.refresh_token,
+        "expires": tokens.expires or (token_expiry_seconds(tokens.access_token) * 1000),
+        "account_id": tokens.account_id,
+        "id_token": tokens.id_token,
+        "source": "device-code",
+        "updated_at": int(time.time()),
+    }
+    path.write_text(json.dumps(payload, indent=2))
+    path.chmod(0o600)
+
+
+def post_json(url: str, payload: dict[str, Any], *, timeout: float = 30.0) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "CodexOAuth/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise CodexOAuthError(f"POST {url} failed with HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise CodexOAuthError(f"POST {url} failed: {exc}") from exc
+
+
+def post_form(url: str, fields: dict[str, str], *, timeout: float = 30.0) -> dict[str, Any]:
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "CodexOAuth/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise CodexOAuthError(f"POST {url} failed with HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise CodexOAuthError(f"POST {url} failed: {exc}") from exc
+
+
+def tokens_from_oauth_response(raw: dict[str, Any], fallback_refresh: str = "") -> Tokens:
+    access_token = str(raw.get("access_token") or "")
+    if not access_token:
+        raise CodexOAuthError("OAuth response did not include access_token.")
+    refresh_token = str(raw.get("refresh_token") or fallback_refresh or "")
+    id_token = str(raw.get("id_token") or "")
+    expires_in = float(raw.get("expires_in") or 3600)
+    expires = (time.time() + expires_in) * 1000
+    account_id = extract_account_id(access_token, id_token)
+    return Tokens(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires=expires,
+        account_id=account_id,
+        id_token=id_token,
+        source="device-code",
+    )
+
+
+def refresh_tokens(tokens: Tokens, auth_file: Path) -> Tokens:
+    if not tokens.refresh_token:
+        raise CodexOAuthError("No refresh token available. Run with --login to create a private Codex OAuth session.")
+    raw = post_form(
+        TOKEN_URL,
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": tokens.refresh_token,
+            "client_id": CLIENT_ID,
+        },
+    )
+    refreshed = tokens_from_oauth_response(raw, fallback_refresh=tokens.refresh_token)
+    refreshed.source = "private-store"
+    refreshed.auth_file = auth_file
+    save_private_tokens(auth_file, refreshed)
+    return refreshed
+
+
+def device_login(auth_file: Path) -> Tokens:
+    device = post_json(
+        f"{ISSUER}/api/accounts/deviceauth/usercode",
+        {"client_id": CLIENT_ID},
+        timeout=30.0,
+    )
+    user_code = str(device.get("user_code") or "")
+    device_auth_id = str(device.get("device_auth_id") or "")
+    interval = max(3, int(device.get("interval") or 5))
+    if not user_code or not device_auth_id:
+        raise CodexOAuthError("Device-code response was missing user_code or device_auth_id.")
+
+    print()
+    print("Open this URL in your browser:")
+    print(f"  {ISSUER}/codex/device")
+    print()
+    print("Enter this code:")
+    print(f"  {user_code}")
+    print()
+    print("Waiting for sign-in. Press Ctrl+C to cancel.")
+
+    start = time.monotonic()
+    authorization_code = ""
+    code_verifier = ""
+    while time.monotonic() - start < 15 * 60:
+        time.sleep(interval)
+        try:
+            poll = post_json(
+                f"{ISSUER}/api/accounts/deviceauth/token",
+                {"device_auth_id": device_auth_id, "user_code": user_code},
+                timeout=30.0,
+            )
+        except CodexOAuthError as exc:
+            message = str(exc)
+            if "HTTP 403" in message or "HTTP 404" in message:
+                continue
+            raise
+        authorization_code = str(poll.get("authorization_code") or "")
+        code_verifier = str(poll.get("code_verifier") or "")
+        if authorization_code and code_verifier:
+            break
+
+    if not authorization_code or not code_verifier:
+        raise CodexOAuthError("Timed out waiting for device login.")
+
+    raw_tokens = post_form(
+        TOKEN_URL,
+        {
+            "grant_type": "authorization_code",
+            "code": authorization_code,
+            "redirect_uri": f"{ISSUER}/deviceauth/callback",
+            "client_id": CLIENT_ID,
+            "code_verifier": code_verifier,
+        },
+        timeout=30.0,
+    )
+    tokens = tokens_from_oauth_response(raw_tokens)
+    tokens.auth_file = auth_file
+    save_private_tokens(auth_file, tokens)
+    print(f"Saved private Codex OAuth tokens to {auth_file}")
+    return tokens
+
+
+def resolve_tokens(args: argparse.Namespace) -> Tokens:
+    auth_file = Path(args.auth_file).expanduser()
+
+    if args.login:
+        return device_login(auth_file)
+
+    env_token = os.environ.get("CODEX_AUTH_TOKEN", "").strip()
+    if env_token:
+        return Tokens(
+            access_token=env_token,
+            account_id=extract_account_id(env_token),
+            source="CODEX_AUTH_TOKEN",
+        )
+
+    private = tokens_from_private_store(auth_file)
+    if private:
+        if is_token_expiring(private):
+            return refresh_tokens(private, auth_file)
+        return private
+
+    cli = tokens_from_codex_cli(Path(args.codex_cli_auth_file).expanduser())
+    if cli and not is_token_expiring(cli):
+        # Use this access token for immediate compatibility, but do not refresh
+        # the shared Codex CLI token. Run --login for an independent session.
+        return cli
+
+    return device_login(auth_file)
+
+
+def codex_headers(tokens: Tokens) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": "codex_cli_rs/0.0.0 (CodexOAuth)",
+        "originator": "codex_cli_rs",
+    }
+    account_id = tokens.account_id or extract_account_id(tokens.access_token, tokens.id_token)
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
+    return headers
+
+
+def extract_text_from_response(response: dict[str, Any], collected_items: list[dict[str, Any]]) -> str:
+    output_text = response.get("output_text")
+    if isinstance(output_text, str) and output_text:
+        return output_text
+
+    output = response.get("output")
+    if not isinstance(output, list) or not output:
+        output = collected_items
+
+    parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+    return "".join(parts)
+
+
+def stream_codex_response(args: argparse.Namespace, prompt: str, tokens: Tokens) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": args.model,
+        "instructions": args.instructions,
+        "input": [{"role": "user", "content": prompt}],
+        "store": False,
+        "stream": True,
+    }
+    if args.reasoning != "none":
+        payload["reasoning"] = {"effort": args.reasoning, "summary": "auto"}
+        payload["include"] = ["reasoning.encrypted_content"]
+
+    request = urllib.request.Request(
+        CODEX_RESPONSES_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=codex_headers(tokens),
+        method="POST",
+    )
+
+    final_response: dict[str, Any] = {}
+    collected_items: list[dict[str, Any]] = []
+    streamed_parts: list[str] = []
+
+    try:
+        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                if line == "data: [DONE]":
+                    break
+                try:
+                    event = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                event_type = event.get("type")
+                if event_type == "response.output_text.delta":
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        streamed_parts.append(delta)
+                        if not args.no_stream and not args.json:
+                            print(delta, end="", flush=True)
+                elif event_type == "response.output_item.done":
+                    item = event.get("item")
+                    if isinstance(item, dict):
+                        collected_items.append(item)
+                elif event_type == "response.completed":
+                    response_obj = event.get("response")
+                    if isinstance(response_obj, dict):
+                        final_response = response_obj
+                elif event_type in {"response.failed", "response.incomplete"}:
+                    response_obj = event.get("response")
+                    detail = json.dumps(response_obj, indent=2) if isinstance(response_obj, dict) else str(event)
+                    raise CodexOAuthError(f"Codex returned {event_type}:\n{detail}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 401 and tokens.source == "private-store" and tokens.refresh_token:
+            refreshed = refresh_tokens(tokens, Path(args.auth_file).expanduser())
+            return stream_codex_response(args, prompt, refreshed)
+        raise CodexOAuthError(f"Codex request failed with HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise CodexOAuthError(f"Codex request failed: {exc}") from exc
+
+    text = "".join(streamed_parts) or extract_text_from_response(final_response, collected_items)
+    if not args.json:
+        if args.no_stream:
+            print(text)
+        elif text and not text.endswith("\n"):
+            print()
+
+    return {
+        "text": text,
+        "response": final_response,
+        "collected_items": collected_items,
+        "auth_source": tokens.source,
+        "model": args.model,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Call the ChatGPT Codex backend directly with Codex OAuth.",
+    )
+    parser.add_argument("request", nargs="*", help="Prompt to send. If omitted, stdin is used.")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model to use. Default: {DEFAULT_MODEL}")
+    parser.add_argument("--instructions", default=DEFAULT_INSTRUCTIONS)
+    parser.add_argument("--reasoning", choices=["none", "low", "medium", "high", "xhigh"], default="none")
+    parser.add_argument("--auth-file", default=str(DEFAULT_AUTH_FILE), help="Private OAuth token cache.")
+    parser.add_argument("--codex-cli-auth-file", default=str(DEFAULT_CODEX_CLI_AUTH_FILE), help="Fallback Codex CLI auth.json.")
+    parser.add_argument("--login", action="store_true", help="Create or refresh a private OAuth session with device-code login.")
+    parser.add_argument("--status", action="store_true", help="Show auth status without sending a request.")
+    parser.add_argument("--no-stream", action="store_true", help="Print only after the response completes.")
+    parser.add_argument("--json", action="store_true", help="Print JSON with text, auth source, and final response.")
+    parser.add_argument("--timeout", type=float, default=300.0)
+    return parser.parse_args()
+
+
+def read_prompt(args: argparse.Namespace) -> str:
+    if args.request:
+        return " ".join(args.request).strip()
+    if not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+    return input("Request: ").strip()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        tokens = resolve_tokens(args)
+        if args.status:
+            account_id = tokens.account_id or extract_account_id(tokens.access_token, tokens.id_token)
+            expires = token_expiry_seconds(tokens.access_token)
+            print(f"auth source: {tokens.source}")
+            print(f"auth file: {tokens.auth_file or 'env/none'}")
+            print(f"account id: {account_id or 'unknown'}")
+            if expires:
+                print(f"access token expires: {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(expires))}")
+            else:
+                print("access token expires: unknown")
+            return 0
+
+        prompt = read_prompt(args)
+        if not prompt:
+            raise CodexOAuthError("No request provided.")
+        result = stream_codex_response(args, prompt, tokens)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        return 0
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+    except CodexOAuthError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

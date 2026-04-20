@@ -1,0 +1,12 @@
+[project]
+name = "codex-oauth-direct-api"
+version = "0.1.0"
+description = "A local OpenAI-compatible API and CLI backed by direct ChatGPT Codex OAuth."
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.111,<1",
+    "uvicorn>=0.30,<1",
+]
+
+[project.scripts]
+codex-oauth-api = "codex_oauth_api:main"
