@@ -156,3 +156,5 @@ Then requests need:
 ## More
 
 Read [docs/SETUP.md](docs/SETUP.md) for setup details, [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the backend flow, and [docs/TOOL_CALLING.md](docs/TOOL_CALLING.md) for tool-calling behavior.
+
+For RLM integration notes, read [docs/RLM.md](docs/RLM.md).
