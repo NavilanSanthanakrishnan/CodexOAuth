@@ -462,13 +462,57 @@ def chat_messages_to_responses(messages: list[dict[str, Any]]) -> tuple[str, lis
                 }
             )
         else:
-            item: dict[str, Any] = {"role": role, "content": content if content is not None else ""}
             if role == "assistant" and isinstance(message.get("tool_calls"), list):
-                # Keep visible assistant text. Tool call continuity is intentionally
-                # minimal here; full agent loops should use the Responses endpoint.
-                item["content"] = extract_text_content(content)
-            input_items.append(item)
+                text = extract_text_content(content)
+                if text:
+                    input_items.append({"role": "assistant", "content": text})
+                input_items.extend(chat_tool_calls_to_responses_items(message["tool_calls"]))
+                continue
+            if role == "assistant" and isinstance(message.get("function_call"), dict):
+                text = extract_text_content(content)
+                if text:
+                    input_items.append({"role": "assistant", "content": text})
+                input_items.append(chat_function_call_to_responses_item(message["function_call"]))
+                continue
+            input_items.append({"role": role, "content": content if content is not None else ""})
     return "\n\n".join(instructions), input_items or [{"role": "user", "content": ""}]
+
+
+def chat_tool_calls_to_responses_items(tool_calls: list[Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        call_type = str(call.get("type") or "function")
+        if call_type != "function":
+            continue
+        function = call.get("function")
+        if not isinstance(function, dict):
+            continue
+        call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
+        item_id = call_id if call_id.startswith("fc_") else f"fc_{uuid.uuid4().hex}"
+        items.append(
+            {
+                "type": "function_call",
+                "id": item_id,
+                "call_id": call_id,
+                "name": function.get("name") or "",
+                "arguments": function.get("arguments") or "{}",
+                "status": "completed",
+            }
+        )
+    return items
+
+
+def chat_function_call_to_responses_item(function_call: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "function_call",
+        "id": f"fc_{uuid.uuid4().hex}",
+        "call_id": f"call_{uuid.uuid4().hex[:24]}",
+        "name": function_call.get("name") or "",
+        "arguments": function_call.get("arguments") or "{}",
+        "status": "completed",
+    }
 
 
 def normalize_tools(raw_tools: Any) -> list[dict[str, Any]] | None:
@@ -502,7 +546,7 @@ def apply_common_payload_fields(payload: dict[str, Any], upstream_payload: dict[
     tools = normalize_tools(payload.get("tools"))
     if tools:
         upstream_payload["tools"] = tools
-        upstream_payload["tool_choice"] = payload.get("tool_choice", "auto")
+        upstream_payload["tool_choice"] = normalize_tool_choice(payload.get("tool_choice", "auto"))
         if "parallel_tool_calls" in payload:
             upstream_payload["parallel_tool_calls"] = bool(payload.get("parallel_tool_calls"))
 
@@ -517,6 +561,22 @@ def apply_common_payload_fields(payload: dict[str, Any], upstream_payload: dict[
         upstream_payload["include"] = payload["include"]
 
     return upstream_payload
+
+
+def normalize_tool_choice(tool_choice: Any) -> Any:
+    if tool_choice in (None, "auto", "none", "required"):
+        return tool_choice or "auto"
+    if not isinstance(tool_choice, dict):
+        return "auto"
+    if tool_choice.get("type") == "function":
+        function = tool_choice.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            return {"type": "function", "name": function["name"]}
+    if tool_choice.get("type") == "custom":
+        custom = tool_choice.get("custom")
+        if isinstance(custom, dict) and isinstance(custom.get("name"), str):
+            return {"type": "custom", "name": custom["name"]}
+    return tool_choice
 
 
 def normalize_reasoning(reasoning: dict[str, Any]) -> dict[str, Any]:
@@ -756,6 +816,7 @@ def stream_chat_completions(upstream_payload: dict[str, Any], requested_model: s
         }
     )
     finish_reason = "stop"
+    tool_call_index = 0
     try:
         for event in iter_codex_events(upstream_payload):
             event_type = event.get("type")
@@ -775,6 +836,8 @@ def stream_chat_completions(upstream_payload: dict[str, Any], requested_model: s
                 item = event.get("item")
                 if isinstance(item, dict) and item.get("type") == "function_call":
                     finish_reason = "tool_calls"
+                    current_index = tool_call_index
+                    tool_call_index += 1
                     yield sse_bytes(
                         {
                             "id": completion_id,
@@ -787,7 +850,7 @@ def stream_chat_completions(upstream_payload: dict[str, Any], requested_model: s
                                     "delta": {
                                         "tool_calls": [
                                             {
-                                                "index": 0,
+                                                "index": current_index,
                                                 "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:24]}",
                                                 "type": "function",
                                                 "function": {"name": item.get("name") or "", "arguments": item.get("arguments") or "{}"},

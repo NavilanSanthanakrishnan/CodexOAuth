@@ -19,6 +19,7 @@ It sends structured Responses requests directly and does not require an OpenAI A
 - `codex_oauth_api.py`: local FastAPI server exposing OpenAI-style `/v1/responses` and `/v1/chat/completions`.
 - `docs/SETUP.md`: setup and usage guide.
 - `docs/HOW_IT_WORKS.md`: explanation of the OAuth/backend flow.
+- `docs/TOOL_CALLING.md`: function/tool-calling compatibility notes.
 
 ## Install
 
@@ -154,4 +155,4 @@ Then requests need:
 
 ## More
 
-Read [docs/SETUP.md](docs/SETUP.md) for setup details and [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the backend flow.
+Read [docs/SETUP.md](docs/SETUP.md) for setup details, [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the backend flow, and [docs/TOOL_CALLING.md](docs/TOOL_CALLING.md) for tool-calling behavior.

@@ -86,6 +86,8 @@ POST /v1/responses
 POST /v1/chat/completions
 ```
 
+Tool definitions are forwarded to the backend. If the model returns a function call, CodexOAuth returns that function call to the client. The client or agent framework is responsible for running the tool and sending the tool output back.
+
 ## Request Shape
 
 CodexOAuth sends a structured Responses payload:
