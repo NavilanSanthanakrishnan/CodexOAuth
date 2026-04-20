@@ -1,6 +1,6 @@
 # How It Works
 
-CodexOAuth uses the same Codex OAuth system that Hermes-style integrations use for the OpenAI Codex provider.
+CodexOAuth uses Codex OAuth tokens to call the ChatGPT Codex backend directly.
 
 ## OAuth
 
@@ -102,4 +102,4 @@ CodexOAuth sends a structured Responses payload:
 }
 ```
 
-That is the direct provider path used by Hermes-style Codex OAuth integrations.
+That direct request shape keeps the CLI and local API small, fast, and easy to inspect.

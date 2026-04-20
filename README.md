@@ -2,7 +2,7 @@
 
 Direct ChatGPT Codex OAuth access from a local CLI and an OpenAI-compatible local API.
 
-This project is the direct OAuth path used by Hermes-style Codex integrations:
+It sends requests straight to the ChatGPT Codex backend:
 
 ```text
 your app
